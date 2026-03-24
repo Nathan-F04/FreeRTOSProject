@@ -1,0 +1,820 @@
+/*
+ * userApp.c
+ *
+ *  Created on: Created on: Oct 29, 2025
+ *      Author: Niall.OKeeffe@atu.ie
+ */
+
+/*
+ * The code works as follows:
+ * Connects to internet and ubidots (subscribes to relevant topics) and prints current time
+ * using the RTC task
+ *
+ * If a user enters "s" in the terminal TIM6 (a two second timer), and two software timers
+ * one for ten seconds the other for fifteen will start. They will pass task notification bits
+ * to allow temperature, humidity, distance and pressure to be read when the relevant timer releases
+ * them ie humidity is read every fifteen seconds. Putting "x" in the terminal will stop the timers.
+ * Putting any other character will result in an error message being printed.
+ * The data is read and the data source is set in the task before being placed on a queue for the
+ * publish task. The publish task sets the payload
+ * Qos etc and publishes the data on ubidots.
+ *
+ * A slider controls servo pwm. By setting the slider on ubidots the subscribe handler will put a value to a queue and
+ * the servo task will read the value from a the queue and set the pwm.
+ * The servo is set for a 50Hz pulse on TIM16.
+ *
+ * A similar function is called for setting LED brightness in accordance with distance measured
+ * via proximity sensor. The LED pulse is set for 1kHz on TIM2.
+ *
+ * Accelerometer readings require 3 event bits to be set, the button on the STM, the switch on the
+ * dashboard, and the manual input on the dashboard must send the string "test" to set the final
+ * bit. Only when all three are set will an accelerometer reading be read and published in the
+ * same format as the other data tasks.
+ */
+
+#include "main.h"
+#include "userApp.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
+#include "queue.h"
+#include "event_groups.h"
+#include "timers.h"
+#include "stm32l475e_iot01_accelero.h"
+#include "vl53l0x_proximity.h"
+#include "stm32l475e_iot01_tsensor.h"
+#include "stm32l475e_iot01_psensor.h"
+#include "stm32l475e_iot01_hsensor.h"
+
+//Peripheral Handles
+extern UART_HandleTypeDef huart1;
+extern TIM_HandleTypeDef htim6;
+extern TIM_HandleTypeDef htim16;
+extern TIM_HandleTypeDef htim2;
+
+//Network variables
+extern int network_wr(Network *n, unsigned char *buffer, int len, int timeout_ms);
+extern int network_rd(Network *n, unsigned char *buffer, int len, int timeout_ms);
+extern int net_if_init(void *if_ctxt);
+extern int net_if_deinit(void *if_ctxt);
+extern int net_if_reinit(void *if_ctxt);
+extern int wifi_net_if_init(void *if_ctxt);
+
+//RTOS task function prototypes and object declarations
+//Tasks
+static void initTask(void *pvParameters);
+static void temperatureTask(void *pvParameters);
+static void pressureTask(void *pvParameters);
+static void humidityTask(void *pvParameters);
+static void publishTask(void *pvParameters);
+static void servoTask(void *pvParameters);
+static void LEDTask(void *pvParameters);
+static void accelerometerTask(void *pvParameters);
+static void distanceTask(void *pvParameters);
+static void RTC_Task(void *pvParameters);
+
+//Functions
+void servo(uint16_t anglePassed);
+void set_LED_PWM(uint16_t PWM_Passed);
+
+//Queue handles
+QueueHandle_t publishQueue = NULL, servoQueue = NULL, LEDQueue = NULL;
+
+//Event and semaphore handles
+SemaphoreHandle_t oneSecondSemaphore = NULL;
+
+//SW timer handle
+TimerHandle_t tenSecondTimerHandle = NULL, fifteenSecondTimerHandle = NULL;
+
+//Task handles
+TaskHandle_t temperatureTaskHandle = NULL, pressureTaskHandle = NULL, humidityTaskHandle = NULL, distanceTaskHandle = NULL;
+
+//Event group handle
+EventGroupHandle_t AccelerometerEventGroup = NULL;
+
+//Globals
+uint8_t ch;
+
+//Task notification bits to allow tasks to publish
+#define temperatureBit (1<<0)
+#define pressureBit (1<<1)
+#define humidityBit (1<<2)
+#define distanceBit (1<<3)
+
+//Event bits to allow accelerometer to publish
+#define switchBit (1<<0)
+#define manualInputBit (1<<1)
+#define buttonBit (1<<2)
+
+//Source IDs
+#define temperatureSource 1
+#define humiditySource 2
+#define pressureSource 3
+#define accelerometerSource 4
+#define distanceSource 5
+
+uint8_t RTC_TaskRunning = 0;
+
+uint8_t timeDisplay = 0, readSensor = 0;
+net_hnd_t hnet;
+Network network;
+MQTTPacket_connectData options = MQTTPacket_connectData_initializer;
+net_sockhnd_t socket;
+MQTTClient client;
+
+//Struct to pass data to queue
+typedef struct {
+	uint8_t sourceID;
+	float data;
+} publishStruct;
+
+typedef struct {
+	char *HostName;
+	char *HostPort;
+	char *ConnSecurity;
+	char *MQClientId;
+	char *MQUserName;
+	char *MQUserPwd;
+#ifdef LITMUS_LOOP
+  char *LoopTopicId;
+#endif
+} device_config_t;
+
+/*--------------------------------------------------------------------
+ * EXTI interrupt handler callback function
+ * Will give a semaphore when the user button is pressed
+ --------------------------------------------------------------------*/
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+	BaseType_t xHigherPriorityTaskWoken;
+	switch (GPIO_Pin) {
+	case (GPIO_PIN_1):	//IRQ generated by WiFi module
+	{
+		SPI_WIFI_ISR();
+		break;
+	}
+
+	case (BUTTON_EXTI13_Pin):	//IRQ generated by user button
+	{
+		xHigherPriorityTaskWoken = pdFALSE;
+		xEventGroupSetBitsFromISR(AccelerometerEventGroup, switchBit, &xHigherPriorityTaskWoken);
+		printf("Button pressed\r\n");
+		portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+	}
+
+	default: {
+		break;
+	}
+	}
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+	if (huart->Instance == USART1) {
+		//Timer control
+		if (ch == 's') {
+			printf("Starting timers\r\n");
+			xTimerStartFromISR(tenSecondTimerHandle, &xHigherPriorityTaskWoken);
+			xTimerStartFromISR(fifteenSecondTimerHandle, &xHigherPriorityTaskWoken);
+			HAL_TIM_Base_Start_IT(&htim6);
+			portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+		} else if (ch == 'x') {
+			printf("Stopping timers\r\n");
+			xTimerStopFromISR(tenSecondTimerHandle, &xHigherPriorityTaskWoken);
+			xTimerStopFromISR(fifteenSecondTimerHandle, &xHigherPriorityTaskWoken);
+			HAL_TIM_Base_Stop_IT(&htim6);
+			portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+		} else {
+			printf("Entered wrong character\r\n");
+			portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+		}
+		HAL_UART_Receive_IT(&huart1, &ch, 1);
+	}
+}
+/*--------------------------------------------------------------------
+ * RTC timer event interrupt handler callback function
+ * Runs every second and gives a semaphore if the RTC task is running
+ --------------------------------------------------------------------*/
+void HAL_RTCEx_WakeUpTimerEventCallback(RTC_HandleTypeDef *hrtc) {
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+	if (RTC_TaskRunning) {
+		xHigherPriorityTaskWoken = pdFALSE;
+		xSemaphoreGiveFromISR(oneSecondSemaphore, &xHigherPriorityTaskWoken);
+		portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+	}
+}
+
+/*--------------------------------------------------------------------------
+ * Subscribe message callback function
+ * Called every time a publish meassage is received from a subscribed topic
+ --------------------------------------------------------------------------*/
+void subscribeMessageHandler(MessageData *data) {
+	static char mqtt_msg[MQTT_MSG_BUFFER_SIZE], mqtt_topic[MQTT_TOPIC_BUFFER_SIZE];
+	snprintf(mqtt_msg, data->message->payloadlen + 1, "%s", (char*) data->message->payload);
+	snprintf(mqtt_topic, data->topicName->lenstring.len + 1, "%s", data->topicName->lenstring.data);
+	printf("\r\nPublished message from MQTT broker\r\n");
+
+	printf("Topic: %s, Payload: %s\r\n\n", mqtt_topic, mqtt_msg);
+
+	char *ptr = NULL;
+
+	//Check for switch on dashboard to be high
+	if (strstr(mqtt_topic, "firstdevice/button")) {
+		if (strstr(mqtt_msg, "\"value\": 1.0")) {
+			printf("Button bit set\r\n");
+			xEventGroupSetBits(AccelerometerEventGroup, buttonBit);
+		}
+	}
+	//Check if string "test" was sent from manual input on dashboard
+	if (strstr(mqtt_topic, "firstdevice/manualinput")) {
+		if (strstr(mqtt_msg, "\"\": \"test\"")) {
+			printf("Manual input bit set\r\n");
+			xEventGroupSetBits(AccelerometerEventGroup, manualInputBit);
+		}
+	}
+	//Check if slider value on dashboard changed and set servo
+	if (strstr(mqtt_topic, "firstdevice/slider")) {
+		if ((ptr = strstr(mqtt_msg, "\"value\""))) {
+			ptr = strchr(ptr, ':');
+			if (ptr != 0) {
+				ptr++;
+				uint16_t servoAngle = atoi(ptr);
+				printf("Servo set to %u\r\n", servoAngle);
+				xQueueSend(servoQueue, &servoAngle, 0);
+				//servo(servoAngle);
+			}
+		}
+	}
+	//Check if distance changed to pass for LED PWM
+	if (strstr(mqtt_topic, "firstdevice/distance")) {	//check topic (variable)
+		if ((ptr = strstr(mqtt_msg, "\"value\""))) {
+			ptr = strchr(ptr, ':');
+			if (ptr != 0) {
+				ptr++;
+				uint16_t LED_PWM = atoi(ptr);
+				printf("LED PWM passed %u\r\n", LED_PWM);
+				xQueueSend(LEDQueue, &LED_PWM, 0);
+				//set_LED_PWM(LED_PWM);
+			}
+		}
+	}
+}
+
+//Tim 6 controls if distance is read and then published
+void TIM6_handler() {
+	printf("tim6 handler expired, setting distance bit\r\n");
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+	xTaskNotifyFromISR(distanceTaskHandle, distanceBit, eSetBits, &xHigherPriorityTaskWoken);
+	portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+//Ten second timer controls if temperature and pressure is read and then published
+static void tenSecondTimerCallBack(TimerHandle_t xTimer) {
+	printf("Ten second timer expired, setting pressure and temperature bits\r\n");
+	//give task notifications
+	xTaskNotify(temperatureTaskHandle, temperatureBit, eSetBits);
+	xTaskNotify(pressureTaskHandle, pressureBit, eSetBits);
+}
+
+//Fifteen second timer controls if humidity is read and then published
+static void fifteenSecondTimerCallBack(TimerHandle_t xTimer) {
+	printf("Fifteen second timer expired, setting humidity bit\r\n");
+	//give task notifications
+	xTaskNotify(humidityTaskHandle, humidityBit, eSetBits);
+}
+
+//Temperature task waits for specific TNV bit
+static void temperatureTask(void *pvParameters) {
+	publishStruct temperatureMsg;
+	uint32_t TNV;
+	printf("Starting Temperature Task\r\n");
+
+	BSP_TSENSOR_Init();		//Initialise temperature sensor
+	while (1) {
+		TNV = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+		if (TNV & temperatureBit) {
+			//Bit given, data and source set and struct put on queue for publishing
+			memset(&temperatureMsg, 0, sizeof(publishStruct));
+			temperatureMsg.data = BSP_TSENSOR_ReadTemp();
+			temperatureMsg.sourceID = temperatureSource;
+			xQueueSend(publishQueue, &temperatureMsg, 0);
+		}
+	}
+}
+
+//Pressure task waits for specific TNV bit
+static void pressureTask(void *pvParameters) {
+	publishStruct pressureMsg;
+	printf("Starting pressure Task\r\n");
+
+	BSP_PSENSOR_Init();		//Initialise pressure sensor
+	uint32_t TNV;
+	while (1) {
+		TNV = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+		if (TNV & pressureBit) {
+			//Bit given, data and source set and struct put on queue for publishing
+			memset(&pressureMsg, 0, sizeof(publishStruct));
+			pressureMsg.data = BSP_PSENSOR_ReadPressure();
+			pressureMsg.sourceID = pressureSource;
+			xQueueSend(publishQueue, &pressureMsg, 0);
+		}
+	}
+}
+
+//Humidity task waits for specific TNV bit
+static void humidityTask(void *pvParameters) {
+	publishStruct humidityMsg;
+	printf("Starting Humidity Task\r\n");
+
+	BSP_HSENSOR_Init();		//Initialise humidity sensor
+	uint32_t TNV;
+	while (1) {
+		TNV = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+		if (TNV & humidityBit) {
+			//Bit given, data and source set and struct put on queue for publishing
+			memset(&humidityMsg, 0, sizeof(publishStruct));
+			humidityMsg.data = BSP_HSENSOR_ReadHumidity();
+			humidityMsg.sourceID = humiditySource;
+			xQueueSend(publishQueue, &humidityMsg, 0);
+		}
+	}
+}
+
+//Publish task reads from queue and publishes
+static void publishTask(void *pvParameters) {
+	publishStruct pubMsg;
+	MQTTMessage mqtt;
+	//Increased from 25 to allow accelerometer size data not to overflow
+	char data[64];
+	while (1) {
+		if (xQueueReceive(publishQueue, &pubMsg, portMAX_DELAY) == pdTRUE) {
+			switch (pubMsg.sourceID) {
+			case temperatureSource:
+				uint16_t temperatureI = pubMsg.data * 10;
+				sprintf(data, "{\"temperature\":%d.%d}", temperatureI / 10, temperatureI % 10);
+				printf("Publishing Temperature: %sC\r\n", data);
+				memset(&mqtt, 0, sizeof(MQTTMessage));
+				mqtt.qos = QOS0;
+				mqtt.payload = data;
+				mqtt.payloadlen = strlen(data);
+				MQTTPublish(&client, "/v1.6/devices/firstdevice", &mqtt);
+				break;
+			case humiditySource:
+				uint16_t humidityI = pubMsg.data * 10;
+				sprintf(data, "{\"humidity\":%d.%d}", humidityI / 10, humidityI % 10);
+				printf("Publishing humidity: %s%%\r\n", data);
+				memset(&mqtt, 0, sizeof(MQTTMessage));
+				mqtt.qos = QOS0;
+				mqtt.payload = (char*) data;
+				mqtt.payloadlen = strlen(data);
+				MQTTPublish(&client, "/v1.6/devices/firstdevice", &mqtt);
+				break;
+			case pressureSource:
+				uint16_t pressureI = pubMsg.data * 10;
+				sprintf(data, "{\"pressure\":%d.%d}", pressureI / 10, pressureI % 10);
+				printf("Publishing pressure: %sPa\r\n", data);
+				memset(&mqtt, 0, sizeof(MQTTMessage));
+				mqtt.qos = QOS0;
+				mqtt.payload = (char*) data;
+				mqtt.payloadlen = strlen(data);
+				MQTTPublish(&client, "/v1.6/devices/firstdevice", &mqtt);
+				break;
+			case accelerometerSource:
+				int16_t accelerometerI = pubMsg.data * 10;
+				sprintf(data, "{\"accelerometer\":%hd.%hd}", accelerometerI / 10, accelerometerI % 10);
+				printf("Publishing accelerometer: %s\r\n", data);
+				memset(&mqtt, 0, sizeof(MQTTMessage));
+				mqtt.qos = QOS0;
+				mqtt.payload = (char*) data;
+				mqtt.payloadlen = strlen(data);
+				MQTTPublish(&client, "/v1.6/devices/firstdevice", &mqtt);
+				break;
+			case distanceSource:
+				uint16_t distanceI = pubMsg.data * 10;
+				sprintf(data, "{\"distance\":%d.%d}", distanceI / 10, distanceI % 10);
+				printf("Publishing distance: %smm\r\n", data);
+				memset(&mqtt, 0, sizeof(MQTTMessage));
+				mqtt.qos = QOS0;
+				mqtt.payload = (char*) data;
+				mqtt.payloadlen = strlen(data);
+				MQTTPublish(&client, "/v1.6/devices/firstdevice", &mqtt);
+				break;
+			}
+		}
+	}
+}
+
+//Servo task reads from queue and sets PWM
+static void servoTask(void *pvParameters) {
+	uint16_t serVal;
+	while (1) {
+		if (xQueueReceive(servoQueue, &serVal, portMAX_DELAY) == pdTRUE) {
+			//Receives from queue and finds value for ccr1 and sets
+			uint16_t Min_ARR = 1120, Max_ARR = 8495, AngleRange = 210, CCRVal;
+			CCRVal = ((Max_ARR - Min_ARR) * serVal) / AngleRange + Min_ARR;
+			TIM16->CCR1 = CCRVal;
+		}
+	}
+}
+
+//LED task reads from queue and sets PWM
+static void LEDTask(void *pvParameters) {
+	uint16_t distance_passed;
+	while (1) {
+		if (xQueueReceive(LEDQueue, &distance_passed, portMAX_DELAY) == pdTRUE) {
+			//Distance is passed and used to calculate brightness for LED
+			uint16_t total_distance = 2000, Max_ARR = 1000, CCRVal;
+			CCRVal = ((total_distance - distance_passed) * Max_ARR) / total_distance;
+			TIM2->CCR2 = CCRVal;
+		}
+	}
+}
+
+//Accelerometer task waits for all 3 event bits
+static void accelerometerTask(void *pvParameters) {
+	publishStruct accelerometerMsg;
+	int16_t getXYZ[3];
+	printf("Starting Accelerometer Task\r\n");
+	BSP_ACCELERO_Init();		//Initialise accelerometer sensor
+	while (1) {
+		//Wait for bits before reading data
+		xEventGroupWaitBits(AccelerometerEventGroup, buttonBit | manualInputBit | switchBit, pdTRUE, pdTRUE, portMAX_DELAY);
+		BSP_ACCELERO_AccGetXYZ(getXYZ);
+		memset(&accelerometerMsg, 0, sizeof(publishStruct));
+		//Set data, source and put the struct on a queue
+		accelerometerMsg.data = (float) getXYZ[0];
+		accelerometerMsg.sourceID = accelerometerSource;
+		xQueueSend(publishQueue, &accelerometerMsg, 0);
+	}
+}
+
+//Distance task waits for specific TNV bit
+static void distanceTask(void *pvParameters) {
+	uint32_t TNV;
+	publishStruct distanceMsg;
+	printf("Starting Distance Task\r\n");
+	VL53L0X_PROXIMITY_Init(); //Initialise  sensor
+	while (1) {
+		TNV = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+		if (TNV & distanceBit) {
+			//Bit given, data and source set and struct put on queue for publishing
+			memset(&distanceMsg, 0, sizeof(publishStruct));
+			distanceMsg.data = (float) VL53L0X_PROXIMITY_GetDistance();
+			distanceMsg.sourceID = distanceSource;
+			xQueueSend(publishQueue, &distanceMsg, 0);
+		}
+	}
+}
+
+/*-----------------------------------------------------------
+ * Task to print the date and time when a semaphore is taken
+ -------------------------------------------------------------*/
+static void RTC_Task(void *pvParameters) {
+	RTC_TimeTypeDef sTime;
+	RTC_DateTypeDef sDate;
+	char timeBuffer[40];
+
+	RTC_TaskRunning = 1; //flag set to allow RTC event interrupt handler callback to send semaphores
+
+	while (1) {
+		MQTTYield(&client, 200); //Yield needed to allow check for received published messages from subscribed topics
+
+		if (xSemaphoreTake(oneSecondSemaphore, 0) == pdTRUE) {
+			timeDisplay = 0;
+			HAL_RTC_GetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
+			HAL_RTC_GetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
+			sprintf(timeBuffer, "%02d/%02d/%02d %02d:%02d:%02d\r\n", sDate.Date, sDate.Month, sDate.Year, sTime.Hours + 1, sTime.Minutes, sTime.Seconds);
+			printf("%s", timeBuffer);
+		}
+		vTaskDelay(pdMS_TO_TICKS(100));
+	}
+}
+
+/*--------------------------------------
+ * Initialisation Task
+ * 1. Connects to ubidots MQTT broker
+ * 2. Initialises temperature sensor
+ * 3. Creates semaphores
+ * 4. Creates temperature and RTC tasks
+ * 5. Subscribes to LED_Control variable
+ * 6. Task deletes itself
+ ----------------------------------------*/
+static void initTask(void *pvParameters) {
+	uint32_t ret;
+	printf("Starting Init Task\r\n");
+
+	while (1) {
+		//Start timer for pwm
+		//Servo timer
+		TIM16->CCR1 = 0;
+		HAL_TIM_PWM_Start(&htim16, TIM_CHANNEL_1);
+		//LED timer
+		TIM2->CCR2 = 0;
+		HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+
+		brokerConnect(&client);	//connect to WiFi access point and then to MQTT broker
+
+		//Create event group for accelerometer
+		AccelerometerEventGroup = xEventGroupCreate();
+
+		//Enable UART1 for receive interrupt
+		HAL_UART_Receive_IT(&huart1, &ch, 1);
+
+		//Clear pending IRQ for timer
+		__HAL_TIM_CLEAR_IT(&htim6, TIM_IT_UPDATE);
+		HAL_NVIC_GetPendingIRQ(TIM6_DAC_IRQn);
+
+		//Semaphore for RTC
+		oneSecondSemaphore = xSemaphoreCreateBinary();
+		vQueueAddToRegistry(oneSecondSemaphore, "RTC Semaphore");
+
+		//Create queues
+		publishQueue = xQueueCreate(10, sizeof(publishStruct));
+		servoQueue = xQueueCreate(5, sizeof(uint16_t));
+		LEDQueue = xQueueCreate(5, sizeof(uint16_t));
+
+		//Create tasks
+		//Servo
+		if (xTaskCreate(servoTask, "Servo Task", 500, NULL, configMAX_PRIORITIES - 3, NULL) == pdTRUE) {
+			printf("Servo task created\n\r");
+		} else {
+			printf("Could not create servo task\n\r");
+		}
+		//LED task
+		if (xTaskCreate(LEDTask, "LED Task", 500, NULL, configMAX_PRIORITIES - 3, NULL) == pdTRUE) {
+			printf("LED task created\n\r");
+		} else {
+			printf("Could not create led task\n\r");
+		}
+		//Temperature task
+		if (xTaskCreate(temperatureTask, "Temperature Task", 500, NULL, configMAX_PRIORITIES - 3, &temperatureTaskHandle) == pdTRUE) {
+			printf("Temperature task created\n\r");
+		} else {
+			printf("Could not create temperature task\n\r");
+		}
+
+		//Pressure task
+		if (xTaskCreate(pressureTask, "Pressure Task", 500, NULL, configMAX_PRIORITIES - 3, &pressureTaskHandle) == pdTRUE) {
+			printf("Pressure task created\n\r");
+		} else {
+			printf("Could not create pressure task\n\r");
+		}
+
+		//Humidity task
+		if (xTaskCreate(humidityTask, "Humidity Task", 500, NULL, configMAX_PRIORITIES - 3, &humidityTaskHandle) == pdTRUE) {
+			printf("Humidity task created\n\r");
+		} else {
+			printf("Could not create humidity task\n\r");
+		}
+
+		//Publish task
+		if (xTaskCreate(publishTask, "Publish  Task", 500, NULL, configMAX_PRIORITIES - 4, NULL) == pdTRUE) {
+			printf("Publish task created\n\r");
+		} else {
+			printf("Could not create publish task\n\r");
+		}
+
+		//Acceloromter task
+		if (xTaskCreate(accelerometerTask, "Accelerometer Task", 500, NULL, configMAX_PRIORITIES - 3, NULL) == pdTRUE) {
+			printf("Accelerometer task created\n\r");
+		} else {
+			printf("Could not create accelerometer task\n\r");
+		}
+
+		//Distance task
+		if (xTaskCreate(distanceTask, "Distance Task", 500, NULL, configMAX_PRIORITIES - 3, &distanceTaskHandle) == pdTRUE) {
+			printf("Distance task created\n\r");
+		} else {
+			printf("Could not create distance task\n\r");
+		}
+
+		//RTC task
+		if (xTaskCreate(RTC_Task, "RTC Task", 500, NULL,
+		configMAX_PRIORITIES - 2, NULL) == pdTRUE) {
+			printf("RTC task created\n\r");
+		} else {
+			printf("Could not create RTC task\n\r");
+		}
+
+		//Sw timers creation
+		tenSecondTimerHandle = xTimerCreate("Ten Second Timer", pdMS_TO_TICKS(10000), pdTRUE, 0, tenSecondTimerCallBack);
+		fifteenSecondTimerHandle = xTimerCreate("Fifteen Second Timer", pdMS_TO_TICKS(15000), pdTRUE, 0, fifteenSecondTimerCallBack);
+
+		//Subscribe to topics here
+		//Button for event bit
+		ret = MQTTSubscribe(&client, "/v1.6/devices/firstdevice/button", QOS0, (subscribeMessageHandler));
+		if (ret != MQSUCCESS) {
+			printf("\n\rSubscribe to button failed: %ld\n\r", ret);
+		} else {
+			printf("\n\rSubscribed to button \n\r");
+			ret = MQTTYield(&client, 500);
+		}
+
+		//Slider for pwm of servo
+		ret = MQTTSubscribe(&client, "/v1.6/devices/firstdevice/slider", QOS0, (subscribeMessageHandler));
+		if (ret != MQSUCCESS) {
+			printf("\n\rSubscribe to slider failed: %ld\n\r", ret);
+		} else {
+			printf("\n\rSubscribed to slider \n\r");
+			ret = MQTTYield(&client, 500);
+		}
+
+		//Manual input for event bit
+		ret = MQTTSubscribe(&client, "/v1.6/devices/firstdevice/manualinput", QOS0, (subscribeMessageHandler));
+		if (ret != MQSUCCESS) {
+			printf("\n\rSubscribe to manual input failed: %ld\n\r", ret);
+		} else {
+			printf("\n\rSubscribed to manual input \n\r");
+			ret = MQTTYield(&client, 500);
+		}
+
+		//Distance for led pwm
+		ret = MQTTSubscribe(&client, "/v1.6/devices/firstdevice/distance", QOS0, (subscribeMessageHandler));
+		if (ret != MQSUCCESS) {
+			printf("\n\rSubscribe to distance failed: %ld\n\r", ret);
+		} else {
+			printf("\n\rSubscribed to distance\n\r");
+			ret = MQTTYield(&client, 500);
+		}
+
+		printf("Deleting Init Task\r\n\n");
+		vTaskDelete(NULL);
+	}
+}
+
+/*-----------------------------------------------
+ * User application function
+ * Creates Init task and starts ROS scheduler
+ -------------------------------------------------*/
+void userApp() {
+	printf("Starting user application\r\n\n");
+	xTaskCreate(initTask, "Init Task", 2000, NULL, configMAX_PRIORITIES - 1, NULL);
+	vTaskStartScheduler();
+	while (1) {
+	}
+}
+
+/*-------------------------------------------------
+ * Function to establish connection to cloud server
+ * 1. Connects to WiFi access point (AP)
+ * 2. Gets date and time from network
+ * 3. Connects to ubidots web server
+ * 4. Connects to Ubidots MQTT broker
+ ---------------------------------------------------*/
+void brokerConnect(MQTTClient *client) {
+	int32_t ret;
+//Network and MQTT variables
+	device_config_t MQTT_Config;
+	static unsigned char mqtt_send_buffer[MQTT_SEND_BUFFER_SIZE];
+	static unsigned char mqtt_read_buffer[MQTT_READ_BUFFER_SIZE];
+	net_ipaddr_t ipAddr;
+	net_macaddr_t macAddr;
+
+#ifdef USE_MBED_TLS
+	conn_sec_t connection_security = CONN_SEC_UNDEFINED;
+	const char *device_cert = NULL;
+	const char *device_key = NULL;
+#endif
+
+//Initialise MQTT broker structure
+//Fill in this section with MQTT broker credentials from header file
+	MQTT_Config.HostName = CloudBroker_HostName;
+	MQTT_Config.HostPort = CloudBroker_Port;
+	MQTT_Config.ConnSecurity = "0";	//plain TCP connection with no security
+	MQTT_Config.MQUserName = CloudBroker_Username;
+	MQTT_Config.MQUserPwd = CloudBroker_Password;
+	MQTT_Config.MQClientId = CloudBroker_ClientID;
+
+//Initialise WiFi network
+	if (net_init(&hnet, NET_IF, (wifi_net_if_init)) != NET_OK) {
+		printf("\n\rError");
+	} else {
+		printf("\n\rOK");
+	}
+	HAL_Delay(500);
+
+	printf("\n\rRetrieving the IP address.");
+
+	if (net_get_ip_address(hnet, &ipAddr) != NET_OK) {
+		printf("\n\rError 2");
+	} else {
+		switch (ipAddr.ipv) {
+		case NET_IP_V4:
+			printf("\n\rIP address: %d.%d.%d.%d\n\r", ipAddr.ip[12], ipAddr.ip[13], ipAddr.ip[14], ipAddr.ip[15]);
+			break;
+		case NET_IP_V6:
+		default:
+			printf("\n\rError 3");
+		}
+	}
+
+	if (net_get_mac_address(hnet, &macAddr) == NET_OK) {
+		printf("\n\rMac Address: %02x:%02x:%02x:%02x:%02x:%02x\r\n", macAddr.mac[0], macAddr.mac[1], macAddr.mac[2], macAddr.mac[3], macAddr.mac[4], macAddr.mac[5]);
+	}
+
+	/*
+	 * Fetch the epoch time from st.com and use it to set the RTC time
+	 */
+	if (setRTCTimeDateFromNetwork(true) != TD_OK) {
+		printf("Fail setting time\r\n");
+	} else {
+		printf("Time set, Starting RTC\r\n");
+		//RTC started with a 1-second wake-up interrupt
+		HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, 2047,
+		RTC_WAKEUPCLOCK_RTCCLK_DIV16);
+	}
+
+#ifdef USE_MBED_TLS
+	printf("Connecting to MQTT Broker Server using TLS\r\n\n");
+//Create network socket
+//ret = net_sock_create(hnet, &socket, NET_PROTO_TCP);
+	connection_security = CONN_SEC_SERVERAUTH;
+//ret = net_sock_create(hnet, &socket, (connection_security == CONN_SEC_NONE) ? NET_PROTO_TCP :NET_PROTO_TLS);
+	ret = net_sock_create(hnet, &socket, NET_PROTO_TLS);
+#else
+	printf("Connecting to MQTT Broker Server\r\n\n");
+	ret = net_sock_create(hnet, &socket, NET_PROTO_TCP);
+#endif
+	if (ret != NET_OK) {
+		printf("\n\rCould not create the socket.\r\n");
+		printf("Check MQTT broker configuration settings.\r\n");
+		while (1)
+			;
+	} else {
+#ifdef USE_MBED_TLS
+		//ret |= net_sock_setopt(socket, "sock_noblocking", NULL, 0);
+		switch (connection_security) {
+		case CONN_SEC_MUTUALAUTH:
+			ret |= ((checkTLSRootCA() != 0) && (checkTLSDeviceConfig() != 0)) || (getTLSKeys(&ca_cert, &device_cert, &device_key) != 0);
+			ret |= net_sock_setopt(socket, "tls_server_name", (void*) CloudBroker_HostName, strlen(CloudBroker_HostName) + 1);
+			ret |= net_sock_setopt(socket, "tls_ca_certs", (void*) ca_cert, strlen(ca_cert) + 1);
+			ret |= net_sock_setopt(socket, "tls_dev_cert", (void*) device_cert, strlen(device_cert) + 1);
+			ret |= net_sock_setopt(socket, "tls_dev_key", (void*) device_key, strlen(device_key) + 1);
+			break;
+		case CONN_SEC_SERVERNOAUTH:
+			ret |= net_sock_setopt(socket, "tls_server_noverification",
+			NULL, 0);
+			ret |= (checkTLSRootCA() != 0) || (getTLSKeys(&ca_cert, NULL, NULL) != 0);
+			ret |= net_sock_setopt(socket, "tls_server_name", (void*) CloudBroker_HostName, strlen(CloudBroker_HostName) + 1);
+			ret |= net_sock_setopt(socket, "tls_ca_certs", (void*) ca_cert, strlen(ca_cert) + 1);
+			break;
+		case CONN_SEC_SERVERAUTH:
+			ret |= net_sock_setopt(socket, "tls_server_name", (void*) CloudBroker_HostName, strlen(CloudBroker_HostName) + 1);
+			ret |= net_sock_setopt(socket, "tls_ca_certs", (void*) ca_cert, strlen(ca_cert) + 1);
+			break;
+		case CONN_SEC_NONE:
+			break;
+		default:
+			msg_error("Invalid connection security mode. - %d\n", connection_security)
+			;
+		}
+#endif
+		ret |= net_sock_setopt(socket, "sock_noblocking", NULL, 0);
+		if (ret != NET_OK) {
+			printf("Could not retrieve the security connection settings and set the socket options.\n");
+			while (1)
+				;
+		} else {
+
+			ret = net_sock_open(socket, MQTT_Config.HostName, atoi(CloudBroker_Port), 0);
+			if (ret != NET_OK) {
+				printf("\n\rCould not open the socket.");
+				while (1)
+					;
+			} else {
+#ifdef USE_MBED_TLS
+				printf("\r\nTLS connection established to MQTT Broker Server\r\n\n");
+#else
+				printf("\r\nConnection established to MQTT Broker Server\r\n\n");
+#endif
+				HAL_Delay(1000);
+			}
+		}
+
+		network.my_socket = socket;
+		network.mqttread = (network_rd);
+		network.mqttwrite = (network_wr);
+
+		MQTTClientInit(client, &network, MQTT_CMD_TIMEOUT, mqtt_send_buffer,
+		MQTT_SEND_BUFFER_SIZE, mqtt_read_buffer, MQTT_READ_BUFFER_SIZE);
+
+		/* MQTT connect */
+		options.clientID.cstring = MQTT_Config.MQClientId;
+		options.username.cstring = MQTT_Config.MQUserName;
+		options.password.cstring = MQTT_Config.MQUserPwd;
+
+		HAL_Delay(1000);
+
+		printf("Connecting client to MQTT Broker\r\n\n");
+		ret = MQTTConnect(client, &options);
+		if (ret != 0) {
+			printf("\n\rMQTTConnect() failed: %ld\n", ret);
+			printf("Check MQTT client credential settings.\r\n");
+			while (1)
+				;
+		} else {
+			printf("\n\rClient Connected to MQTT Broker\r\n");
+			HAL_Delay(1000);
+		}
+		HAL_Delay(1000);
+	}
+}
