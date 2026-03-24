@@ -1,0 +1,34 @@
+# IDE / workspace settings
+.settings/
+.metadata/
+.vscode/
+.idea/
+
+# Build folders
+Debug/
+debug/
+Release/
+release/
+build/
+
+# Dependency files (auto-generated)
+*.d
+
+# Object files (compiled artifacts)
+*.o
+*.obj
+
+# Linker outputs
+*.map
+
+# Executables / firmware outputs
+*.elf
+*.hex
+*.bin
+*.out
+
+# Debug files (optional, but usually safe to ignore)
+*.su
+*.pdb
+*.idb
+*.dSYM/
